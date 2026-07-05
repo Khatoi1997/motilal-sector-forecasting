@@ -1,0 +1,16 @@
+jupyter
+
+pandas
+numpy<2.2
+matplotlib
+seaborn
+
+scikit-learn
+
+pandas-datareader
+yfinance
+tensorflow
+
+lightgbm
+xgboost
+shap

@@ -11,23 +11,29 @@ class SectorDataEngine:
 
     def downcast_memory(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Optimizes data types to reduce memory footprint up to 70%.
+        Optimizes numeric data types to reduce memory footprint up to 70%.
+        Uses native pandas validation to safely skip text, dates, and string dtypes.
         """
         for col in df.columns:
-            col_type = df[col].dtype
-            if col_type != object:
+            # Safely check if the column is numeric using pandas native utility
+            if pd.api.types.is_numeric_dtype(df[col]):
                 c_min = df[col].min()
                 c_max = df[col].max()
-                if str(col_type)[:3] == 'int':
+                
+                # Handle Integer downcasting
+                if pd.api.types.is_integer_dtype(df[col]):
                     if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
                         df[col] = df[col].astype(np.int8)
                     elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
                         df[col] = df[col].astype(np.int16)
                     elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
                         df[col] = df[col].astype(np.int32)
-                else:
+                
+                # Handle Float downcasting
+                elif pd.api.types.is_float_dtype(df[col]):
                     if c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
                         df[col] = df[col].astype(np.float32)
+                        
         return df
 
     def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
