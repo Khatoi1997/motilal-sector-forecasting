@@ -1,4 +1,5 @@
 import lightgbm as lgb
+import xgboost as xgb
 import pandas as pd
 import numpy as np
 import shap
@@ -6,75 +7,83 @@ import shap
 class SectorModelEngine:
     def __init__(self, features: list, target: str):
         """
-        Engine to handle LightGBM training and advisor-focused SHAP explanations.
-        Optimized to prevent Out-Of-Memory crashes on Databricks Free Tier.
+        Ensemble Engine running LightGBM + XGBoost side-by-side.
+        Optimized for memory-efficient blending on single-node hardware.
         """
         self.features = features
         self.target = target
-        self.model = None
-        self.explainer = None
+        self.lgb_model = None
+        self.xgb_model = None
 
-    def train_sector_model(self, train_df: pd.DataFrame, val_df: pd.DataFrame) -> lgb.Booster:
+    def train_sector_models(self, train_df: pd.DataFrame, val_df: pd.DataFrame):
         """
-        Trains a highly efficient LightGBM model for a specific sector.
+        Trains both LightGBM and XGBoost models for a specific sector.
         """
-        # Convert dataframes into highly compressed native LightGBM Datasets
-        dtrain = lgb.Dataset(train_df[self.features], label=train_df[self.target])
-        dval = lgb.Dataset(val_df[self.features], label=val_df[self.target], reference=dtrain)
+        X_train, y_train = train_df[self.features], train_df[self.target]
+        X_val, y_val = val_df[self.features], val_df[self.target]
+
+        # --- 1. Train LightGBM ---
+        dtrain_lgb = lgb.Dataset(X_train, label=y_train)
+        dval_lgb = lgb.Dataset(X_val, label=y_val, reference=dtrain_lgb)
         
-        # Lightweight parameters optimized for single-node CPU execution
-        params = {
-            'objective': 'regression',
-            'metric': 'mape',  # Mean Absolute Percentage Error for tracking precision
-            'boosting_type': 'gbdt',
-            'learning_rate': 0.05,
-            'num_leaves': 31,
-            'max_depth': 6,
-            'feature_fraction': 0.8,
-            'bagging_fraction': 0.8,
-            'bagging_freq': 5,
-            'verbose': -1,
-            'n_jobs': -1  # Utilize all cores on the single Databricks node
+        lgb_params = {
+            'objective': 'regression', 'metric': 'mape', 'boosting_type': 'gbdt',
+            'learning_rate': 0.05, 'num_leaves': 31, 'max_depth': 6, 'verbose': -1, 'n_jobs': -1
+        }
+        self.lgb_model = lgb.train(
+            lgb_params, dtrain_lgb, num_boost_round=500,
+            valid_sets=[dval_lgb], callbacks=[lgb.early_stopping(30, verbose=False)]
+        )
+
+        # --- 2. Train XGBoost ---
+        # Convert to native DMatrix for extreme speed and low memory
+        dtrain_xgb = xgb.DMatrix(X_train, label=y_train)
+        dval_xgb = xgb.DMatrix(X_val, label=y_val)
+        
+        xgb_params = {
+            'objective': 'reg:squarederror', 'eval_metric': 'mape',
+            'learning_rate': 0.05, 'max_depth': 5, 'subsample': 0.8, 'colsample_bytree': 0.8, 'nthread': -1
         }
         
-        # Train model with early stopping to prevent over-fitting
-        self.model = lgb.train(
-            params,
-            dtrain,
-            num_boost_round=500,
-            valid_sets=[dtrain, dval],
-            callbacks=[lgb.early_stopping(stopping_rounds=30, verbose=False)]
+        # XGBoost early stopping requires an explicit evaluation list
+        evallist = [(dval_xgb, 'eval')]
+        self.xgb_model = xgb.train(
+            xgb_params, dtrain_xgb, num_boost_round=500,
+            evals=evallist, early_stopping_rounds=30, verbose_eval=False
         )
-        return self.model
 
-    def generate_advisor_insights(self, latest_market_data: pd.DataFrame) -> pd.DataFrame:
+    def generate_ensemble_insights(self, latest_market_data: pd.DataFrame) -> pd.DataFrame:
         """
-        Generates next-day predictions and extracts highly targeted TreeSHAP 
-        explanations for the top driving factors to assist sectoral advisors.
+        Blends LightGBM and XGBoost predictions and uses stable multi-model
+        TreeSHAP calculations to flag primary signal drivers for advisors.
         """
-        if self.model is None:
-            raise ValueError("Model must be trained before generating insights.")
-            
-        # 1. Predict next-day target returns
-        preds = self.model.predict(latest_market_data[self.features])
+        if self.lgb_model is None or self.xgb_model is None:
+            raise ValueError("Both models must be trained before generating insights.")
+
+        X_latest = latest_market_data[self.features]
+        dlatest_xgb = xgb.DMatrix(X_latest)
+
+        # 1. Generate blended predictions (50/50 Blend)
+        lgb_preds = self.lgb_model.predict(X_latest)
+        xgb_preds = self.xgb_model.predict(dlatest_xgb)
+        ensemble_preds = (lgb_preds + xgb_preds) / 2.0
+
         insights_df = latest_market_data[['date', 'ticker', 'sector', 'close']].copy()
-        insights_df['predicted_next_day_return'] = preds
+        insights_df['predicted_next_day_return'] = ensemble_preds
+
+        # 2. Extract blended feature drivers using TreeSHAP
+        lgb_explainer = shap.TreeExplainer(self.lgb_model)
+        xgb_explainer = shap.TreeExplainer(self.xgb_model)
         
-        # 2. Compute TreeSHAP Explanations (Optimized for quick execution)
-        if self.explainer is None:
-            self.explainer = shap.TreeExplainer(self.model)
-            
-        shap_values = self.explainer.shap_values(latest_market_data[self.features])
-        
-        # Extract the top two driving features for each individual stock prediction
+        # Average the SHAP impact matrices across both model perspectives
+        shap_blended = (lgb_explainer.shap_values(X_latest) + xgb_explainer.shap_values(X_latest)) / 2.0
+
         top_feature_1 = []
         top_feature_2 = []
         
         for i in range(len(latest_market_data)):
-            # Sort features by absolute contribution to the specific prediction
-            row_shap = shap_values[i]
+            row_shap = shap_blended[i]
             sorted_indices = np.argsort(np.abs(row_shap))[::-1]
-            
             top_feature_1.append(self.features[sorted_indices[0]])
             top_feature_2.append(self.features[sorted_indices[1]])
             
